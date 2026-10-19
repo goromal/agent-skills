@@ -1,12 +1,13 @@
 # Verified implementation patterns
 
 These snippets are abridged from proof-of-concept daemons that compiled, ran
-and passed their acceptance traces. The daemons implemented the tutorial specs
-and the [command gate example](examples/04-command-gate/SPEC.md). Omitted
-parts are marked with comments or `/* ... */`.
-Baseline: msrs `9528ecf`, cu29 `=1.0.0-rc2`, statig `0.4.1`, rustc 1.96, Linux,
-2026-10-18. Snippets use the current msrs API. Re-check anything that depends
-on a different pin.
+and passed their acceptance traces. The daemons implemented the eight tutorial
+specs, from the [indicator](examples/01-indicator/SPEC.md) to the
+[mission service](examples/08-mission-service/SPEC.md). Omitted parts are
+marked with comments or `/* ... */`.
+Baseline: msrs `a1a8370` (examples 5–8; 1–4 on `9528ecf`), cu29 `=1.0.0-rc2`,
+statig `0.4.1`, rustc 1.95, Linux, 2026-10-18. Snippets use the current msrs
+API. Re-check anything that depends on a different pin.
 
 Names are illustrative (`Gate`, `Cycle`, `GateOut`). Each pattern is required by
 a spec decision; do not copy one whose decision your spec does not make.
@@ -28,8 +29,17 @@ serde = { version = "1", features = ["derive"] }
 ```
 
 ```bash
-cargo tree -i cu29 --depth 0   # must print exactly the pinned version
+cargo tree -i cu29-runtime --depth 0   # must print exactly 1.0.0-rc2
 ```
+
+`cargo tree -i cu29` is not a sufficient check. cu29 `1.0.0-rc2` requires its
+sub-crates (`cu29-runtime`, `cu29-derive`, …) with caret requirements, so a
+fresh consumer lock once resolved cu29 rc2 with cu29-runtime 1.3.0:
+`#[copper_runtime]` failed with `cannot find __private in cu29` while
+`-i cu29` still printed rc2. msrs-core from `a1a8370` depends on every cu29
+sub-crate, cu-bincode and cu-bincode-derive exactly, so a consumer that pins
+msrs by revision inherits the baseline. On an older msrs revision, seed the
+service's `Cargo.lock` from msrs's.
 
 The PoCs also built and passed on cu29 1.3.0, where `run()` is deprecated in
 favor of a typed `run_until_shutdown()`. Treat an upgrade as a new baseline:
@@ -310,9 +320,10 @@ latency was about one loop period: roughly 1 ms at 1 kHz over a Unix socket.
 | `run()` installs cu29's ctrlc handler for SIGINT only; SIGTERM killed the process (exit 143) without stopping tasks | `msrs-core` enables `ctrlc`'s `termination` feature, so feature unification makes cu29's handler stop on SIGTERM. Check that SIGTERM exits 0 |
 | A handler panic is caught by `run()`, which stops tasks and returns `Err` | Treat a panic as a service crash in the failure table; supervise and restart. Do not `unwrap` on input-dependent paths |
 | cu29's panic hook writes `copper-crash-<ms>-<pid>.txt` to the current directory, including caught panics | Set the daemon's working directory, include crash files in retention, and avoid panicking test probes in the repo root |
-| Every iteration logs a copperlist, including idle ones: about 590 B per copperlist for a three-task DAG, about 2 GB/h at 1 kHz | Specify loop rate, log location, slab size and retention. rc2 has no setting to skip idle copperlists |
+| Every iteration logs a copperlist, including idle ones. Size follows the payloads: about 590 B per copperlist in the gate PoC (about 2 GB/h at 1 kHz), 70 B for the arming supervisor's mostly empty cycles, plus 4767 B in a step that publishes a 64-leg plan | Measure bytes per copperlist from a real run; specify loop rate, log location, slab size and retention; publish large state on change. rc2 has no setting to skip idle copperlists |
 | The log is split into `<base>_N.copper` slab files with a `<base>.copper` symlink | Rotate or delete the whole family; open the base name for reading |
 | Killed processes leave Unix socket files behind | Remove a stale socket at bind time |
+| `AF_UNIX` socket paths are limited to 108 bytes; a deep working directory failed with "path too long" | Bind relative to the working directory or under `/run` |
 | A second `install()` for one type panics; building without `install()` returns `CuError` | Install exactly once per application build |
 
 ## 8. Tests at the pure seam
@@ -335,38 +346,132 @@ Useful additions to scenario tests:
 
 ## 9. Replay gate
 
+`msrs_core::replay` (from `a1a8370`) supplies the copper-specific parts; the
+service decides which slot is the input and how an empty slot replays.
+
 ```rust
-use cu29::bincode::{config::standard, decode_from_std_read};
+use msrs_core::{read_copperlists, replay_gate, run_step, LogEnd, Recorded};
 
 let ids = <CuMsgs as MatchingTasks>::get_all_task_ids();
-assert_eq!(ids, ["producer", "gate", "egress"]);       // slot order is load-bearing
-let UnifiedLogger::Read(read) = UnifiedLoggerBuilder::new().file_base_name(&log).build()? else { panic!() };
-let mut reader = UnifiedLoggerIOReader::new(read, UnifiedLogType::CopperList);
-let mut machine = GateMachine::default();               // same cold state as the live run
-let mut expected_id = None;
-while let Ok(cl) = decode_from_std_read::<CopperList<CuMsgs>, _, _>(&mut reader, standard()) {
-    if let Some(prev) = expected_id { assert_eq!(cl.id, prev, "gap in copperlist ids"); }
-    expected_id = Some(cl.id + 1);
-    let input = cl.msgs.0 .0.payload().cloned();
-    let recorded = cl.msgs.0 .1.payload().cloned();
-    let replayed = match &input {
-        Some(c) => run_step(&mut machine, &Trigger::Message(c)),
-        None => run_step(&mut machine, &Trigger::Tick(0)), // valid only if ticks are no-ops
-        // (behind IngressTask, replay an empty cycle as Tick at cl.msgs.0 .0.tov)
-    };
-    if replayed != recorded { /* report the FIRST divergence with cl.id, input and both outputs */ }
-}
+assert_eq!(ids, ["producer", "gate", "egress"]);         // slot order is load-bearing
+let (cls, end) = read_copperlists::<CuMsgs>(&log)?;       // CuMsgs from gen_cumsgs!
+assert_eq!(end, LogEnd::Eof, "decoding stopped on an error, not at the end");
+let recorded: Vec<_> = cls.iter().map(|cl| Recorded {
+    id: cl.id,
+    input: cl.msgs.0 .0.payload().expect("producer emits every iteration").clone(),
+    output: cl.msgs.0 .1.payload().cloned(),             // None = no output this step
+}).collect();
+let mut machine = GateMachine::default();                // same cold state as the live run
+let report = replay_gate(&recorded, |c| run_step(&mut machine, &Trigger::Message(c)));
+assert!(report.passed(), "{:?}", report.first_divergence);  // also fails on id gaps
 ```
 
-- The decode loop ends on any decode error, so it cannot tell end-of-log from
-  corruption. Check contiguous copperlist IDs and compare the count with what
-  the run should have produced.
-- Divergence can disappear later. A wrong initial state produced 103 divergent
-  copperlists before a Disable resynchronized the PoC. Fail on the first one.
-- Run a negative control: perturb initialization or one input and require the
-  gate to fail.
+- `read_copperlists` reports how decoding ended. A clean end is
+  `DecodeError::UnexpectedEnd`; corrupting 16 bytes of the copperlist section
+  instead ended decoding early with `Utf8` or `UnexpectedVariant` errors, which
+  it returns as `LogEnd::Error`. A record truncated at the very end still looks
+  like a clean end, so compare the count with what the run should have produced.
+- `replay_gate` compares bincode bytes, not `PartialEq`: a NaN in an `f64`
+  payload is never equal to itself. It reports copperlist id gaps and the
+  first divergence, and keeps replaying, because divergence can disappear
+  later. A wrong initial state produced 103 divergent copperlists before a
+  Disable resynchronized the gate PoC; a perturbed pose in the goto executor
+  healed after 2.
+- Behind `IngressTask`, an empty input slot replays as
+  `Trigger::Tick(t)` with `t` from `cl.msgs.0 .0.tov` (`Tov::Time`); behind
+  `CycleIngressTask` every slot has a payload.
+- Run a negative control that must fail, and make the perturbation
+  observable: change an input the spec makes visible in that step's output.
+  Perturbing the first pose of the goto executor, drained while idle and
+  overwritten 50 ms later, produced no divergence at all.
 - Derive timing evidence from the same log: gaps between recorded `now_ns`,
   FSM `metadata.process_time` (`start`/`end` convert with
   `Option::<CuTime>::from`), and deadline latencies. In the gate PoC, a 1 kHz
   command stream at 100 Hz produced a 10.4 ms maximum gap, 0.026 ms step time
   and a timeout 200.1 ms after the last applied command.
+
+## 10. Ordered internal events and leaf-dependent shared rules
+
+statig dispatches child first, so a leaf that handles an event hides it from
+its superstate. When rules of different precedence share a time step, give
+each group its own internal event and dispatch them in the specified order.
+The goto executor and the mission service run fault rules before progress
+rules:
+
+```rust
+for e in &cycle.events { self.sm.handle_with_context(&ev(e), &mut self.ctx); }
+self.sm.handle_with_context(&Ev::Supervise, &mut self.ctx); // faults, contingencies
+self.sm.handle_with_context(&Ev::Advance, &mut self.ctx);   // arrival, leg progress
+```
+
+A leaf-specific rule that ranks *below* a superstate rule on the same event
+must defer explicitly; otherwise the leaf wins:
+
+```rust
+#[state(superstate = "active")]
+fn approaching(context: &mut Ctx, event: &Ev) -> Outcome<State> {
+    match event {
+        // T9 ranks below the superstate's T6–T8 faults.
+        Ev::Supervise if context.store.fault(context.now_ns).is_none()
+            && context.store.no_progress(context.now_ns) => { /* abort */ Transition(State::idle()) }
+        _ => Super,
+    }
+}
+```
+
+A superstate handler does not know which leaf is active. When a shared rule's
+effect depends on the leaf, as with a contingency table whose columns are
+leaves, have each leaf call one shared function with its column:
+
+```rust
+fn supervise(context: &mut Ctx, col: Column) -> Outcome<State> {
+    match context.store.contingency(context.now_ns, col) {   // first applicable row
+        None => Handled,
+        Some(Action::ToLanding(r)) => { context.store.reason = r; Transition(State::landing()) }
+        /* ... */
+    }
+}
+// in each S2 leaf:  Ev::Supervise => supervise(context, Column::Flying),
+```
+
+A transition between leaves of one composite never runs the composite's entry
+action. When a rule resets data for "the composite", such as per-goal progress
+tracking on preemption, make the reset an effect of the transition.
+
+## 11. Chained FSM stages
+
+Two FSM tasks chain like any other copper tasks. Each stage emits every cycle,
+so the downstream stage never ticks:
+
+```ron
+(
+    tasks: [
+        ( id: "ingress",  type: "MissionIngress", config: { "max_batch": 32 } ),
+        ( id: "planner",  type: "PlannerFsm" ),    // FsmTask<PlannerStage>
+        ( id: "executor", type: "ExecutorFsm" ),   // FsmTask<MissionMachine>
+        ( id: "egress",   type: "MissionEgress" ),
+    ],
+    cnx: [
+        ( src: "ingress",  dst: "planner",  msg: "crate::InCycle" ),
+        ( src: "planner",  dst: "executor", msg: "crate::PlannedCycle" ),
+        ( src: "executor", dst: "egress",   msg: "crate::MissionOut" ),
+    ],
+    runtime: ( rate_target_hz: 50 ),
+)
+```
+
+The first stage consumes its own commands and forwards the rest with its
+outputs (`PlannedCycle { now_ns, events, planner, pending }`). Publish large
+state, such as a compiled plan, only when it changes; the downstream stage
+keeps its own copy.
+
+A DAG is acyclic within an iteration: the downstream stage cannot send a lock
+or acknowledgement upstream in the same step, and a feedback channel would
+apply it at least one cycle late. Prefer ownership transfer: the mission
+executor copies the plan at `Start`, so later uploads cannot change the flight.
+
+Each stage's output is its own copperlist slot, so the gate replays three
+ways: the first stage from the recorded cycles, the second from the first
+stage's recorded output, and both chained from the recorded cycles. A
+perturbed battery value diverged the executor and the chain (425 copperlists)
+but not the planner (0), which localizes a regression to a stage.

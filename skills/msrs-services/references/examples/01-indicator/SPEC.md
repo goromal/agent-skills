@@ -1,6 +1,9 @@
 # A virtual indicator
 
-Status: tutorial specification; not implemented. All A-cases below are planned tests.
+Status: tutorial specification. A proof-of-concept implementation passed its
+acceptance cases on 2026-10-18 (msrs 9528ecf, cu29 =1.0.0-rc2, statig 0.4.1).
+That code is not shipped with the skill; for your implementation, the A-cases
+are planned tests.
 
 ## Purpose and boundary
 

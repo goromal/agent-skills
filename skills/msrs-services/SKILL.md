@@ -9,7 +9,7 @@ Use this skill whenever you are working on a Rust service that uses the **msrs**
 
 **Ground-truth note:** compiler-verified cu29/statig signatures live in the msrs repo at `docs/superpowers/notes/copper-statig-signatures.md`. That file is updated alongside the code and **wins over this skill on any conflict**. Consult it before fighting the compiler on trait shapes, payload bounds, or RON parsing.
 
-**Verified baseline:** the runtime claims below were checked by proof-of-concept daemons built from this skill's four example specs: msrs `9528ecf`, cu29 `=1.0.0-rc2`, statig `0.4.1`, rustc 1.96 (2026-10-18). [Implementation patterns](references/implementation-patterns.md) has the abridged verified code and measurements. msrs adapter behavior (emission limits, tick time, `CycleIngressTask`, signal handling) is covered by msrs's own tests and `examples/`. Re-verify any claim that depends on a different pin.
+**Verified baseline:** the runtime claims below were checked by proof-of-concept daemons built from this skill's eight example specs: msrs `a1a8370` for examples 5–8 (`9528ecf` for 1–4), cu29 `=1.0.0-rc2`, statig `0.4.1`, rustc 1.95–1.96 (2026-10-18). [Implementation patterns](references/implementation-patterns.md) has the abridged verified code and measurements. msrs adapter behavior (emission limits, tick time, `CycleIngressTask`, signal handling) is covered by msrs's own tests and `examples/`. Re-verify any claim that depends on a different pin.
 
 ---
 
@@ -37,9 +37,9 @@ Use this skill whenever you are working on a Rust service that uses the **msrs**
 
 ## Design First: Service Contract + Editable Drawings
 
-Every new service starts from a `SPEC.md`, written or approved by the human before implementation. Read [the service-spec template](references/service-spec-template.md) when designing or reviewing a service. For a first walkthrough, read [the tutorial](references/spec-tutorial.md); it progresses from a two-state indicator through hierarchy and time-dependent behavior to a production-style command gate with authority, batched inputs and a watchdog.
+Every new service starts from a `SPEC.md`, written or approved by the human before implementation. Read [the service-spec template](references/service-spec-template.md) when designing or reviewing a service. For a first walkthrough, read [the tutorial](references/spec-tutorial.md); it progresses from a two-state indicator through hierarchy and time-dependent behavior to a production-style command gate with authority, batched inputs and a watchdog. Examples 5–8 then build a drone mission service: desired versus observed state, a goal lifecycle, an algorithm contract, and a two-stage service with contingencies and restart recovery.
 
-Use **draw.io (`.drawio`) or Excalidraw (`.excalidraw`)** for authored drawings, with an adjacent SVG preview. Preserve the user's chosen editor; do not replace their drawing with Mermaid. Keep editable sources and previews under version control. These text/vector design assets belong with the service spec.
+Use **draw.io (`.drawio`) or Excalidraw (`.excalidraw`)** for authored drawings, with an adjacent SVG preview exported from that source. Examples 1–4 use draw.io and 5–8 Excalidraw. Preserve the user's chosen editor; do not replace their drawing with Mermaid. Keep editable sources and previews under version control. These text/vector design assets belong with the service spec.
 
 The drawing and its associated contracts together form the spec. Use stable state, transition, interface, and requirement IDs to connect drawings, tables, code, and tests. A drawing need not contain every field or timing rule: refer to its contract by ID. Neither prose nor drawing silently overrides the other; resolve disagreements before implementing the affected behavior.
 
@@ -169,9 +169,11 @@ For a composite `enabled` with initial child `idle`, explicitly implement entry 
 Verified 0.4.1 semantics that commonly surprise:
 
 - `Transition(State::current())` is an **external** self-transition that runs exit and entry actions. An internal transition is `Handled`.
-- Sibling transitions inside a composite run only leaf exit/entry. Leaving the composite runs the leaf exit, then the superstate exit, then target entries.
+- Sibling transitions inside a composite run only leaf exit/entry. Leaving the composite runs the leaf exit, then the superstate exit, then target entries. A reset meant for the whole composite, such as per-goal tracking on preemption, therefore belongs in the transition's effects, not the composite's entry action.
 - An event returned as `Super` from the top superstate is silently treated as handled. Give every event a defined result in some handler; do not rely on statig to report unhandled input.
 - If a shared event's effect depends on the leaf, handle it in that leaf and let the others return `Super`. For example, `Release` from `driving` must stop motion.
+- A leaf rule that ranks **below** a superstate rule on the same event wins anyway, because the leaf sees it first. Either check the superstate's condition in the leaf and return `Super`, or split the rules into separate internal events dispatched in order (`Supervise` then `Advance`). A mutation test showed the inversion is otherwise silent.
+- A superstate handler does not know the active leaf. For leaf-dependent shared policy, such as a contingency table whose columns are leaves, call one shared function from each leaf with its column. See [implementation patterns §10](references/implementation-patterns.md#10-ordered-internal-events-and-leaf-dependent-shared-rules).
 - A handler panic propagates out of `FsmTask::process`. `run()` catches it, stops all tasks and returns `Err`, so the service stops. Return a rejection for input-dependent failures instead of `unwrap`/`unreachable!`.
 
 `FsmTask` has one input and one output payload slot, and a step may emit at most once. `FsmBatchTask` forwards every emission of a step as one `Batch<Out>`. These are adapter constraints, not restrictions on conceptual service boundaries or Copper's general capabilities. Composite inputs, output batches, or a different adapter may be required. Derive latency from the actual schedule and queueing behavior; do not assume each additional task adds one tick.
@@ -207,6 +209,7 @@ Re-check the service's pinned msrs revision before choosing an implementation; r
 - **Tick time is logged:** `IngressTask` stamps `tov` on every cycle, empty or not, and `FsmTask` builds `Tick` from that recorded input `tov`, so a replay can rebuild ticks from the log. It falls back to `ctx.now()` only if upstream leaves `tov` unset.
 - **Emission limit:** a second `Effects::emit` in one `FsmTask` step makes `process()` return a `CuError`, and `run_step` panics, so a double emit fails loudly. Use `FsmBatchTask` + `BatchEgressTask` and test with `run_step_all` when a step has several effects. Specify how a batch is applied and how partial application is handled.
 - **Ingress and overload:** `IngressTask` still consumes at most one message per iteration. `TransportDriver::spawn` channels are unbounded; `spawn_bounded(transport, rt, inbound_capacity)` caps transport → DAG (a full channel blocks `send`; a transport that sheds load uses `try_send`). Define queue bounds, ordering and overflow behavior, and preserve acquisition time separately from ingress time when freshness matters.
+- **Chained stages:** several `FsmTask`s chain in one DAG, each stage's output in its own copperlist slot. A downstream stage cannot answer upstream within the same iteration, so a lock or acknowledgement across stages arrives at least one cycle late; prefer ownership transfer such as a plan snapshot. See [implementation patterns §11](references/implementation-patterns.md#11-chained-fsm-stages).
 - **Restart/replay:** the adapter has a no-op `Freezable` implementation. Do not promise restored machine/store state without implementing it; define cold-start state and what replay requires.
 
 **Recommended pattern for timed services** (verified under sustained 1 kHz input, and in msrs's `examples/watchdog`): a source task emits one composite `Cycle { now_ns, events, .. }` payload every iteration. It drains a bounded batch of pending input, then samples the clock. The FSM never sees an empty input and never ticks. Its decision time and batch are recorded payload data. Time rules run inside the step after the batch, for example as an internal `CycleEnd` event. msrs ships this as `msrs_transport::CycleIngressTask<T>` (`Cycle { now_ns, events, pending }`, cap set by RON `config: { "max_batch": N }`), usually paired with `FsmBatchTask` and `BatchEgressTask`. It keeps the queue rather than dropping; write a service-owned producer when the spec requires a drop policy and a `dropped` count. See [implementation patterns §5](references/implementation-patterns.md#5-timed-producer-source-task).
@@ -221,7 +224,7 @@ Timeouts and rate limits compare explicit monotonic timestamps supplied to the p
 
 ### Pin the runtime
 
-A caret requirement such as `cu29 = "1.0.0-rc2"` (`^1.0.0-rc2`) lets a workspace resolve the **newest** compatible cu29: 1.3.0 when tested, not the rc2 this skill and msrs were verified on. msrs pins `=1.0.0-rc2` / `=0.4.1` itself; the service should also pin `cu29 = "=1.0.0-rc2"` and `statig = "=0.4.1"` (or the versions in your pinned msrs revision's `Cargo.lock`), pin msrs by full git revision, and check with `cargo tree -i cu29 --depth 0`. Record the resolved versions in the spec. Treat an upgrade as a new baseline that must pass the tests, daemon checks and replay gate again.
+A caret requirement such as `cu29 = "1.0.0-rc2"` (`^1.0.0-rc2`) lets a workspace resolve the **newest** compatible cu29: 1.3.0 when tested, not the rc2 this skill and msrs were verified on. msrs pins `=1.0.0-rc2` / `=0.4.1` itself; the service should also pin `cu29 = "=1.0.0-rc2"` and `statig = "=0.4.1"` (or the versions in your pinned msrs revision's `Cargo.lock`), pin msrs by full git revision, and check with **`cargo tree -i cu29-runtime --depth 0`**. Pinning the cu29 facade does not pin cu29's own sub-crates, which it requires with carets: a fresh consumer lock once mixed cu29 rc2 with cu29-runtime 1.3.0, `#[copper_runtime]` failed with `cannot find __private in cu29`, and `cargo tree -i cu29` still printed rc2. msrs-core from `a1a8370` pins every cu29 sub-crate and cu-bincode exactly; with an older msrs revision, seed the service's `Cargo.lock` from msrs's. Record the resolved versions in the spec. Treat an upgrade as a new baseline that must pass the tests, daemon checks and replay gate again.
 
 ### Payload rules (the #1 compile-error source)
 
@@ -284,9 +287,9 @@ A long-running service calls `app.run()`: it starts tasks, loops at `rate_target
 
 - **Signals:** `run()` installs cu29's ctrlc handler, which by default catches SIGINT only. SIGTERM, which systemd sends, killed the process with exit 143 without stopping tasks. `msrs-core` depends on `ctrlc` with `termination`, so feature unification makes cu29's handler cover SIGTERM for every consumer. Verify that SIGTERM exits 0.
 - **Panics:** a panic in any task is caught by `run()`, which stops tasks and returns `Err`. cu29's panic hook writes `copper-crash-<ms>-<pid>.txt` into the **current directory**, even for panics the program catches. Set the working directory and supervise restarts.
-- **Log volume:** every iteration writes a copperlist, including idle ones. A three-task DAG used about 590 B per copperlist, about 2 GB/h at 1 kHz. rc2 has no setting to skip idle copperlists. Specify loop rate, log location, slab size and retention. Logs are slab files `<base>_0.copper`, `<base>_1.copper`, … plus a `<base>.copper` symlink; rotate or delete the whole family.
+- **Log volume:** every iteration writes a copperlist, including idle ones. Size follows the payloads: one three-task DAG used about 590 B per copperlist (about 2 GB/h at 1 kHz), another 70 B, and a 64-leg plan payload adds 4767 B to its step. Measure your own, and publish large state on change. rc2 has no setting to skip idle copperlists. Specify loop rate, log location, slab size and retention. Logs are slab files `<base>_0.copper`, `<base>_1.copper`, … plus a `<base>.copper` symlink; rotate or delete the whole family.
 - **Latency:** with source → FSM → sink in one iteration, round trip was about one loop period: roughly 1 ms at 1 kHz over a Unix socket. Derive deadlines from the configured rate and measured step times.
-- **Stale endpoints:** a killed daemon leaves its Unix socket file behind; remove it at bind time.
+- **Stale endpoints:** a killed daemon leaves its Unix socket file behind; remove it at bind time. `AF_UNIX` paths are limited to 108 bytes, so bind relative to the working directory or under `/run`.
 
 See [implementation patterns §6–7](references/implementation-patterns.md#6-daemon-mainrs) for the verified `main.rs`.
 
@@ -351,16 +354,18 @@ assert_eq!(run_step_all(&mut m, &Trigger::Message(&cmd)), vec![expected_output])
 
 Cover every specified transition, guard rejection, internal action, and time boundary, including `deadline - 1` and `deadline`. Test shared events from every descendant state using constructors that reach each leaf through real transitions. Also test competing-event order within one step, required and forbidden effects, and invariants across multi-step scenarios. Two cheap, high-yield additions: an exhaustive state × event table asserting one result and the invariants for every pair, and a seeded randomized trace asserting invariants. Test store queries directly. Edge coverage alone does not demonstrate lifecycle, timing, or physical behavior; add transport/simulation/hardware evidence appropriate to the contract.
 
+Make the in-batch position of every injected input explicit in scenario helpers. A command is checked against the observations drained *before* it in the same cycle; all three first-run test failures in the mission example were tests that assumed otherwise, not service bugs. A simulated peer used in tests is code too: a "landed" snap of 1 cm undid a 1 mm-per-step climb and stalled a daemon run that a coarser test step had hidden.
+
 ### The replay-determinism gate (required before declaring bring-up done)
 
 1. **Capture the complete decision trace:** drive acceptance scenarios through the service's real transport and record initial state/configuration and versions, every ordered trigger (including exact tick timestamps, faults, resets and empty cycles if meaningful), and outputs. Record any arbitration result that depends on external arrival order. Verify that the log actually contains the inputs needed to replay the pure seam; task payloads alone may omit time.
-2. **Read back:** decode the recorded copperlists (`gen_cumsgs!` + `UnifiedLoggerBuilder` read mode + `decode_from_std_read::<CopperList<CuMsgs>, _, _>`). Under the documented cu29 rc2 configuration, do **not** depend on `cu29-export`: its reflect feature conflicts with the transport tasks.
+2. **Read back:** decode the recorded copperlists with `msrs_core::read_copperlists::<CuMsgs>(log)` (`gen_cumsgs!` generates `CuMsgs`; the helper wraps `UnifiedLoggerBuilder` read mode and `decode_from_std_read`). Under the documented cu29 rc2 configuration, do **not** depend on `cu29-export`: its reflect feature conflicts with the transport tasks.
 3. **Replay:** initialize the same state/configuration and invoke `run_step` with the exact recorded trigger sequence. Never substitute replay-machine wall time. Restore a checkpoint only if complete state restoration is implemented; otherwise replay from startup.
-4. **Diff:** compare the specified serialized effect payloads, ordering and absence of output per step. Require bit-identical results for that representation, and report the **first** divergence with its copperlist ID. Divergence can disappear later: a wrong initial state in the gate PoC produced 103 divergent copperlists before a Disable resynchronized it, so a final-state match proves nothing. Diagnose missing trace data, wrong initialization, implementation/version drift and nondeterminism before changing the check. Define separately any timing metadata produced outside the pure seam.
-5. **Prove the gate works:** the `decode_from_std_read` loop stops at the first decode error, so end-of-log and corruption look the same. Check that copperlist IDs are contiguous and that the count matches the run. Run a negative control, such as a perturbed initial state or input, and require the gate to fail.
+4. **Diff:** compare the specified serialized effect payloads, ordering and absence of output per step. Require bit-identical results for that representation, and report the **first** divergence with its copperlist ID. `msrs_core::replay_gate` compares bincode bytes (a NaN in a float payload never equals itself under `PartialEq`) and reports id gaps. For chained FSM stages, replay each stage from its own recorded input as well as the whole chain; the stage that diverges is the one to diagnose. Divergence can disappear later: a wrong initial state in the gate PoC produced 103 divergent copperlists before a Disable resynchronized it, so a final-state match proves nothing. Diagnose missing trace data, wrong initialization, implementation/version drift and nondeterminism before changing the check. Define separately any timing metadata produced outside the pure seam.
+5. **Prove the gate works:** require `read_copperlists` to report `LogEnd::Eof`. Corruption ends decoding with a different error (`Utf8`, `UnexpectedVariant`, …), but a record truncated at the very end still looks like a clean end, so also check that copperlist IDs are contiguous and that the count matches the run. Run a negative control, such as a perturbed initial state or input, and require the gate to fail. Choose a perturbation the spec makes visible in that step's output: perturbing a pose drained while idle, and overwritten 50 ms later, passed the gate vacuously.
 6. **Check requirements:** run scenario assertions and deadline measurements as well. Reproducing an incorrect trace does not make the service correct. When time is a payload field, derive timing evidence from the same log: cycle gaps from `now_ns`, step time from the FSM slot's `metadata.process_time`, and deadline latencies.
 
-msrs's `examples/echo` replays every ingress cycle, with empty ones as `Tick` at their logged `tov`. `examples/watchdog` replays a time-dependent trip decision from recorded `Cycle` payloads under the real clock. Both are scaffolding: neither checks contiguous copperlist IDs or runs a negative control, so neither by itself completes a service's gate. Replaying an empty input as `Tick(0)` is valid only when the machine ignores ticks. See [implementation patterns §9](references/implementation-patterns.md#9-replay-gate).
+msrs's `examples/echo` replays every ingress cycle, with empty ones as `Tick` at their logged `tov`; it is scaffolding with no id or negative-control checks. `examples/watchdog` replays a time-dependent trip decision from recorded `Cycle` payloads under the real clock with the `msrs_core::replay` helpers, requires a clean log end and contiguous ids, and runs a negative control. A service's gate still needs its own requirement checks and timing evidence. Replaying an empty input as `Tick(0)` is valid only when the machine ignores ticks. See [implementation patterns §9](references/implementation-patterns.md#9-replay-gate).
 
 ---
 
@@ -369,6 +374,9 @@ msrs's `examples/echo` replays every ingress cycle, with empty ones as `Tick` at
 - **I/O or clock reads inside Store or handlers** — breaks the replay gate. Time is an explicit recorded input; I/O lives in the Transport.
 - **Bare `String`/`Vec<T>` as a copper payload** — no `TypePath` under reflect-off; use a derive-complete named type.
 - **Unpinned cu29** — the caret requirement resolves to a newer release than msrs was verified on.
+- **Checking the pin with `cargo tree -i cu29`** — it hides drifted cu29 sub-crates; check `-i cu29-runtime`.
+- **A vacuous negative control** — perturbing an input the outputs never reflect proves nothing; perturb something the spec makes observable.
+- **A low-precedence leaf rule sharing an event with a superstate rule** — child-first dispatch inverts the precedence; defer explicitly or split the event.
 - **Lazy statig initialization inside `step`** — initial entry actions run inside the first trigger; initialize eagerly in `Default`.
 - **`Transition` to the current state for an internal rule** — runs exit/entry actions; use `Handled`.
 - **Deadlines driven by `Trigger::Tick`** — starved by sustained input; use a `Cycle` payload.
@@ -397,12 +405,12 @@ msrs's `examples/echo` replays every ingress cycle, with empty ones as `Tick` at
 - [ ] Payloads are derive-complete named types; each `FsmTask` step emits at most one (composite) output, or the task is an `FsmBatchTask`
 - [ ] statig machine initialized eagerly; every event has a defined result; internal transitions use `Handled`
 - [ ] `main.rs` is wiring only
-- [ ] cu29/statig/msrs pinned exactly and resolved versions recorded
+- [ ] cu29/statig/msrs pinned exactly, `cargo tree -i cu29-runtime --depth 0` shows the baseline, and resolved versions recorded
 
 **Determinism**
 - [ ] No wall-clock/random/env reads inside the `FsmSpec` seam; complete ordered triggers and initial state/configuration are recorded
 - [ ] Every time a decision depends on is recorded in a payload, not only in `Tick`
-- [ ] Replay-determinism gate implemented and passing (bit-identical diff, first divergence reported, contiguous IDs, negative control fails)
+- [ ] Replay-determinism gate implemented and passing (bit-identical diff, first divergence reported, clean log end, contiguous IDs, an observable negative control fails; each FSM stage replayed from its own recorded input)
 
 **Testing**
 - [ ] Transition and invariant tests include shared-event precedence, rejection, time boundaries and required/forbidden effects
