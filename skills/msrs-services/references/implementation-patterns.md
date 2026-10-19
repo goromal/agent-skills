@@ -5,19 +5,17 @@ and passed their acceptance traces. The daemons implemented the tutorial specs
 and the [command gate example](examples/04-command-gate/SPEC.md). Omitted
 parts are marked with comments or `/* ... */`.
 Baseline: msrs `9528ecf`, cu29 `=1.0.0-rc2`, statig `0.4.1`, rustc 1.96, Linux,
-2026-10-18. Re-check anything that depends on a different pin.
-[msrs PR #8](https://github.com/goromal/msrs/pull/8) later fixed several of the
-msrs limitations these patterns work around; each affected section ends with an
-"msrs #8" note. The PoC code itself is unchanged and still valid.
+2026-10-18. Snippets use the current msrs API. Re-check anything that depends
+on a different pin.
 
 Names are illustrative (`Gate`, `Cycle`, `GateOut`). Each pattern is required by
 a spec decision; do not copy one whose decision your spec does not make.
 
 ## 1. Pin versions
 
-msrs declares `cu29 = "1.0.0-rc2"`, a caret requirement. A downstream workspace
-without msrs's lockfile resolves the newest compatible release (cu29 1.3.0 at
-the time of testing), not rc2. Pin exactly and confirm:
+A caret requirement (`cu29 = "1.0.0-rc2"`) resolves the newest compatible
+release (cu29 1.3.0 at the time of testing), not rc2. msrs pins exactly; pin the
+service the same way and confirm:
 
 ```toml
 [workspace.dependencies]
@@ -27,16 +25,11 @@ msrs-core = { git = "https://github.com/goromal/msrs", rev = "<full sha>" }
 msrs-transport = { git = "https://github.com/goromal/msrs", rev = "<full sha>" }
 bincode = { package = "cu-bincode", version = "2.0.2", features = ["derive", "alloc"], default-features = false }
 serde = { version = "1", features = ["derive"] }
-ctrlc = { version = "3.5", features = ["termination"] }   # see §7
 ```
 
 ```bash
 cargo tree -i cu29 --depth 0   # must print exactly the pinned version
 ```
-
-msrs #8 pins `=1.0.0-rc2` / `=0.4.1` in its own workspace and enables
-`ctrlc/termination` from `msrs-core`, so the `ctrlc` line is only needed on
-older msrs pins. Keep the service's own exact pins either way.
 
 The PoCs also built and passed on cu29 1.3.0, where `run()` is deprecated in
 favor of a typed `run_until_shutdown()`. Treat an upgrade as a new baseline:
@@ -46,8 +39,7 @@ re-run the tests, daemon checks and replay gate.
 
 A payload is a named struct or enum with the full derive set. Its fields may be
 `String`, `Vec<T>`, `Option<T>` or nested derive-complete types. Bare `String`,
-`Vec<T>` and, before msrs #8, msrs's `TransportEvent<T>` are not payloads. The
-last one lacked the serialization and reflection derives; msrs #8 adds them.
+`Vec<T>` are not payloads; msrs's `TransportEvent<T>` is whenever `T` is.
 Generic payloads (`Cycle<T>`, `Batch<T>`) work through crate-root aliases.
 
 ```rust
@@ -170,10 +162,8 @@ invariant like "disabled implies zero output" true by construction.
 
 ## 4. One step, one composite output
 
-At `9528ecf`, `Effects::take_one` kept the first emission and discarded the
-rest. Since msrs #8 a second emit in an `FsmTask` step is a `CuError` (and
-`run_step` panics), and `FsmBatchTask` forwards every emission as one
-`Batch<Out>`. A composite output built after the whole step remains the
+A second emit in an `FsmTask` step is a `CuError` (and `run_step` panics);
+`FsmBatchTask` forwards every emission as one `Batch<Out>`. A composite output built after the whole step remains the
 simplest way to make the step's effect atomic:
 
 ```rust
@@ -204,17 +194,16 @@ impl GateMachine {
 
 ## 5. Timed producer source task
 
-The stock `FsmTask` creates `Tick(ctx.now())` only when its input is empty.
-Sustained input starves ticks: 50 queued messages over 30 iterations produced
-no tick. With a real clock, the tick time cannot be recovered from the log.
-In the probe, an emitted tick was 1,170,037 ns while recorded `process_time.start`
-was 1,169,784 ns.
+The stock `FsmTask` creates `Tick` only when its input is empty. Sustained
+input starves ticks: 50 queued messages over 30 iterations produced no tick.
 
-When a decision depends on time, use a service-owned source task that emits a
-timed payload every iteration. The time is then recorded data at the pure seam.
+When a decision depends on time, use a source task that emits a timed payload
+every iteration. The time is then recorded data at the pure seam. Start from
+the stock `CycleIngressTask` (below); write a service-owned producer like this
+one when the spec needs a drop policy or a different clock domain.
 
 ```rust
-static EVENTS_RX: Mutex<Option<Receiver<Event>>> = Mutex::new(None);  // installed before build()
+// before build(): msrs_transport::registry::install::<Producer, _>(handles.from_transport);
 
 #[derive(Reflect)]
 pub struct Producer { rx: Receiver<Event> }
@@ -225,9 +214,7 @@ impl CuSrcTask for Producer {
     type Resources<'r> = ();
 
     fn new(_c: Option<&ComponentConfig>, _r: Self::Resources<'_>) -> CuResult<Self> {
-        let rx = EVENTS_RX.lock().unwrap().take()
-            .ok_or_else(|| CuError::from("events rx not installed"))?;
-        Ok(Self { rx })
+        Ok(Self { rx: msrs_transport::registry::take::<Self, _>()? })
     }
 
     fn process(&mut self, ctx: &CuContext, out: &mut Self::Output<'_>) -> CuResult<()> {
@@ -243,8 +230,7 @@ impl CuSrcTask for Producer {
 }
 ```
 
-`IngressTask`'s channel registry is private, so a custom source task needs its
-own injection slot. Draining before sampling time ensures every batched event
+Draining before sampling time ensures every batched event
 arrived before `now_ns`; later arrivals belong to the next cycle.
 
 Choose the clock domain in the spec. `ctx.now()` is cu29's `RobotClock`, a
@@ -260,21 +246,17 @@ fn monotonic_ns() -> u64 {
 }
 ```
 
-The stock `IngressTask` dequeues one message per iteration from an unbounded
-channel. If input outpaces the loop, latency grows without bound. In the probe,
-20 of 50 messages remained after 30 iterations. A producer like this one gives
-the spec an explicit capacity and overflow policy.
+The stock `IngressTask` dequeues one message per iteration. If input outpaces
+the loop, latency grows: in the probe, 20 of 50 messages remained after 30
+iterations. `TransportDriver::spawn_bounded` caps the inbound channel; a
+producer like this one gives the spec an explicit capacity and overflow policy.
 
-msrs #8: `msrs_transport::CycleIngressTask<T>` is a stock version of this
-producer. It emits `Cycle { now_ns, events, pending }` every iteration, drains
-at most `max_batch` (RON config) before reading `ctx.now()`, and leaves overflow
-queued (reported as `pending`) rather than dropping it. Keep a service-owned
-producer when the spec needs a drop policy or a different clock domain such as
-`CLOCK_MONOTONIC`. Custom tasks can now use
-`msrs_transport::registry::{install, take}` instead of a private static, and
-`TransportDriver::spawn_bounded` bounds the inbound channel. msrs #8 also logs
-the tick time: `IngressTask` stamps `tov` every cycle and `FsmTask` ticks at it.
-`examples/watchdog` in msrs is a worked example.
+`msrs_transport::CycleIngressTask<T>` is the stock producer. It emits
+`Cycle { now_ns, events, pending }` every iteration, drains at most `max_batch`
+(RON config) before reading `ctx.now()`, and leaves overflow queued (reported as
+`pending`) rather than dropping it. `IngressTask` also stamps `tov` every cycle
+and `FsmTask` ticks at it, so tick time is in the log. `examples/watchdog` in
+msrs is a worked example.
 
 ## 6. Daemon `main.rs`
 
@@ -288,7 +270,7 @@ gen_cumsgs!("copperconfig.ron");
 
 fn serve(socket: PathBuf, log: PathBuf) {
     let handles = TransportDriver::spawn(MyTransport { socket }, RtConfig::normal());
-    *EVENTS_RX.lock().unwrap() = Some(handles.from_transport);   // before build()
+    msrs_transport::registry::install::<Producer, _>(handles.from_transport); // before build()
     EgressTask::<GateOut>::install(handles.to_transport);
     let mut app = GateApp::builder()
         .with_log_path(&log, Some(64 * 1024 * 1024))
@@ -325,7 +307,7 @@ latency was about one loop period: roughly 1 ms at 1 kHz over a Unix socket.
 
 | Fact (measured) | Required handling |
 |-----------------|-------------------|
-| `run()` installs cu29's ctrlc handler for SIGINT only; SIGTERM killed the process (exit 143) without stopping tasks | On msrs before #8, add `ctrlc` with `features = ["termination"]`; Cargo feature unification makes cu29's handler stop on SIGTERM (msrs #8 does this from `msrs-core`). Check that SIGTERM exits 0 |
+| `run()` installs cu29's ctrlc handler for SIGINT only; SIGTERM killed the process (exit 143) without stopping tasks | `msrs-core` enables `ctrlc`'s `termination` feature, so feature unification makes cu29's handler stop on SIGTERM. Check that SIGTERM exits 0 |
 | A handler panic is caught by `run()`, which stops tasks and returns `Err` | Treat a panic as a service crash in the failure table; supervise and restart. Do not `unwrap` on input-dependent paths |
 | cu29's panic hook writes `copper-crash-<ms>-<pid>.txt` to the current directory, including caught panics | Set the daemon's working directory, include crash files in retention, and avoid panicking test probes in the repo root |
 | Every iteration logs a copperlist, including idle ones: about 590 B per copperlist for a three-task DAG, about 2 GB/h at 1 kHz | Specify loop rate, log location, slab size and retention. rc2 has no setting to skip idle copperlists |
@@ -335,17 +317,11 @@ latency was about one loop period: roughly 1 ms at 1 kHz over a Unix socket.
 
 ## 8. Tests at the pure seam
 
-At `9528ecf`, `run_step` returned only the first emission, so it could not
-prove "exactly one output." Since msrs #8 it panics on a second emission and
-`msrs_core::run_step_all` returns every one; on older pins call `step`
-directly:
+`run_step` panics on a second emission; `msrs_core::run_step_all` returns
+every emission in order, so use it to prove "exactly one output":
 
 ```rust
-fn step_all<M: FsmSpec>(m: &mut M, t: &Trigger<'_, M::In>) -> Vec<M::Out> {
-    let mut e = Effects::default();
-    m.step(t, &mut e);
-    e.take()
-}
+assert_eq!(run_step_all(&mut m, &Trigger::Message(&c)), vec![expected]);
 ```
 
 Useful additions to scenario tests:
@@ -376,7 +352,7 @@ while let Ok(cl) = decode_from_std_read::<CopperList<CuMsgs>, _, _>(&mut reader,
     let replayed = match &input {
         Some(c) => run_step(&mut machine, &Trigger::Message(c)),
         None => run_step(&mut machine, &Trigger::Tick(0)), // valid only if ticks are no-ops
-        // msrs #8: replay an empty IngressTask cycle as Tick(tov) from cl.msgs.0 .0.tov
+        // (behind IngressTask, replay an empty cycle as Tick at cl.msgs.0 .0.tov)
     };
     if replayed != recorded { /* report the FIRST divergence with cl.id, input and both outputs */ }
 }

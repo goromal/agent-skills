@@ -9,7 +9,7 @@ Use this skill whenever you are working on a Rust service that uses the **msrs**
 
 **Ground-truth note:** compiler-verified cu29/statig signatures live in the msrs repo at `docs/superpowers/notes/copper-statig-signatures.md`. That file is updated alongside the code and **wins over this skill on any conflict**. Consult it before fighting the compiler on trait shapes, payload bounds, or RON parsing.
 
-**Verified baseline:** the runtime claims below were checked by proof-of-concept daemons built from this skill's four example specs: msrs `9528ecf`, cu29 `=1.0.0-rc2`, statig `0.4.1`, rustc 1.96 (2026-10-18). [Implementation patterns](references/implementation-patterns.md) has the abridged verified code and measurements. Re-verify any claim that depends on a different pin. [msrs PR #8](https://github.com/goromal/msrs/pull/8) (resolving msrs issues #2–#7) changes the adapter behavior described under "Check adapter capabilities"; where this skill distinguishes the two, "before msrs #8" means revision `9528ecf` and earlier.
+**Verified baseline:** the runtime claims below were checked by proof-of-concept daemons built from this skill's four example specs: msrs `9528ecf`, cu29 `=1.0.0-rc2`, statig `0.4.1`, rustc 1.96 (2026-10-18). [Implementation patterns](references/implementation-patterns.md) has the abridged verified code and measurements. msrs adapter behavior (emission limits, tick time, `CycleIngressTask`, signal handling) is covered by msrs's own tests and `examples/`. Re-verify any claim that depends on a different pin.
 
 ---
 
@@ -135,7 +135,7 @@ impl EchoGate {
 
 Critical details:
 - Context is injected **by parameter name**: the parameter must be called `context`
-- `InitializedStateMachine` is **not `Default`** (init needs the context). Initialize it **eagerly** in a manual `Default` impl for the `FsmSpec` type. `init_with_context` runs the initial leaf's entry actions and those of its superstates. A lazy `Option` pattern (used by msrs's echo example before msrs #8) would run them inside the first trigger's step and attach startup effects to whichever input arrives first.
+- `InitializedStateMachine` is **not `Default`** (init needs the context). Initialize it **eagerly** in a manual `Default` impl for the `FsmSpec` type. `init_with_context` runs the initial leaf's entry actions and those of its superstates. Lazy initialization inside `step` would run them inside the first trigger's step and attach startup effects to whichever input arrives first.
 
 ```rust
 pub struct EchoMachine {
@@ -174,7 +174,7 @@ Verified 0.4.1 semantics that commonly surprise:
 - If a shared event's effect depends on the leaf, handle it in that leaf and let the others return `Super`. For example, `Release` from `driving` must stop motion.
 - A handler panic propagates out of `FsmTask::process`. `run()` catches it, stops all tasks and returns `Err`, so the service stops. Return a rejection for input-dependent failures instead of `unwrap`/`unreachable!`.
 
-`FsmTask` has one input and one output payload slot, and a step may emit at most once. `FsmBatchTask` (msrs #8) forwards every emission of a step as one `Batch<Out>`. These are adapter constraints, not restrictions on conceptual service boundaries or Copper's general capabilities. Composite inputs, output batches, or a different adapter may be required. Derive latency from the actual schedule and queueing behavior; do not assume each additional task adds one tick.
+`FsmTask` has one input and one output payload slot, and a step may emit at most once. `FsmBatchTask` forwards every emission of a step as one `Batch<Out>`. These are adapter constraints, not restrictions on conceptual service boundaries or Copper's general capabilities. Composite inputs, output batches, or a different adapter may be required. Derive latency from the actual schedule and queueing behavior; do not assume each additional task adds one tick.
 
 See [statig's dispatch and transition semantics](https://docs.rs/statig/0.4.1/statig/#implementation). Consult the msrs compiler-verified notes for signatures; its existing flat-machine example does not by itself verify every hierarchical pattern.
 
@@ -201,15 +201,15 @@ impl FsmSpec for EchoMachine {
 
 ### Check adapter capabilities before promising behavior
 
-Re-check the service's pinned msrs revision before choosing an implementation; record any capability gap in its spec rather than weakening its requirements. As of msrs #8:
+Re-check the service's pinned msrs revision before choosing an implementation; record any capability gap in its spec rather than weakening its requirements.
 
 - **Tick starvation:** `FsmTask::process` still chooses `Message` when input is present and `Tick` only otherwise. In a probe, 50 queued messages over 30 iterations produced zero ticks. Watchdogs and deadlines need a bounded, recorded time mechanism that still runs under sustained input: use `CycleIngressTask` (below).
-- **Tick time is logged:** `IngressTask` stamps `tov` on every cycle, empty or not, and `FsmTask` builds `Tick` from that recorded input `tov`, so a replay can rebuild ticks from the log. It falls back to `ctx.now()` only if upstream leaves `tov` unset. *Before msrs #8* the tick time came from a separate unlogged `ctx.now()` call (the probe saw 1,170,037 ns against a recorded `process_time.start` of 1,169,784 ns) and tick-driven decisions could not be replayed with the real clock.
-- **Emission limit:** a second `Effects::emit` in one `FsmTask` step makes `process()` return a `CuError`, and `run_step` panics, so a double emit fails loudly. Use `FsmBatchTask` + `BatchEgressTask` and test with `run_step_all` when a step has several effects. Specify how a batch is applied and how partial application is handled. *Before msrs #8* `Effects::take_one` silently kept only the first emission, both live and in tests.
+- **Tick time is logged:** `IngressTask` stamps `tov` on every cycle, empty or not, and `FsmTask` builds `Tick` from that recorded input `tov`, so a replay can rebuild ticks from the log. It falls back to `ctx.now()` only if upstream leaves `tov` unset.
+- **Emission limit:** a second `Effects::emit` in one `FsmTask` step makes `process()` return a `CuError`, and `run_step` panics, so a double emit fails loudly. Use `FsmBatchTask` + `BatchEgressTask` and test with `run_step_all` when a step has several effects. Specify how a batch is applied and how partial application is handled.
 - **Ingress and overload:** `IngressTask` still consumes at most one message per iteration. `TransportDriver::spawn` channels are unbounded; `spawn_bounded(transport, rt, inbound_capacity)` caps transport → DAG (a full channel blocks `send`; a transport that sheds load uses `try_send`). Define queue bounds, ordering and overflow behavior, and preserve acquisition time separately from ingress time when freshness matters.
 - **Restart/replay:** the adapter has a no-op `Freezable` implementation. Do not promise restored machine/store state without implementing it; define cold-start state and what replay requires.
 
-**Recommended pattern for timed services** (verified under sustained 1 kHz input with a service-owned producer, and in msrs's `examples/watchdog`): a source task emits one composite `Cycle { now_ns, events, .. }` payload every iteration. It drains a bounded batch of pending input, then samples the clock. The FSM never sees an empty input and never ticks. Its decision time and batch are recorded payload data. Time rules run inside the step after the batch, for example as an internal `CycleEnd` event. msrs #8 ships this as `msrs_transport::CycleIngressTask<T>` (`Cycle { now_ns, events, pending }`, cap set by RON `config: { "max_batch": N }`), usually paired with `FsmBatchTask` and `BatchEgressTask`. It keeps the queue rather than dropping; write a service-owned producer when the spec requires a drop policy and a `dropped` count. See [implementation patterns §5](references/implementation-patterns.md#5-timed-producer-source-task).
+**Recommended pattern for timed services** (verified under sustained 1 kHz input, and in msrs's `examples/watchdog`): a source task emits one composite `Cycle { now_ns, events, .. }` payload every iteration. It drains a bounded batch of pending input, then samples the clock. The FSM never sees an empty input and never ticks. Its decision time and batch are recorded payload data. Time rules run inside the step after the batch, for example as an internal `CycleEnd` event. msrs ships this as `msrs_transport::CycleIngressTask<T>` (`Cycle { now_ns, events, pending }`, cap set by RON `config: { "max_batch": N }`), usually paired with `FsmBatchTask` and `BatchEgressTask`. It keeps the queue rather than dropping; write a service-owned producer when the spec requires a drop policy and a `dropped` count. See [implementation patterns §5](references/implementation-patterns.md#5-timed-producer-source-task).
 
 Timeouts and rate limits compare explicit monotonic timestamps supplied to the pure seam. Define clock domain, units, ordering and reset behavior. cu29's `ctx.now()` is a calibrated CPU counter that starts at zero when its clock is created. It is not `CLOCK_MONOTONIC`, and peer processes cannot stamp times in that domain. **Never** read `SystemTime::now()` / `Instant::now()` inside handlers.
 
@@ -221,7 +221,7 @@ Timeouts and rate limits compare explicit monotonic timestamps supplied to the p
 
 ### Pin the runtime
 
-Before msrs #8, msrs declared `cu29 = "1.0.0-rc2"`, which Cargo reads as `^1.0.0-rc2`. A service workspace without msrs's lockfile silently resolved the **newest** compatible cu29: 1.3.0 when tested, not the rc2 this skill and msrs were verified on. msrs now pins `=1.0.0-rc2` / `=0.4.1` itself, which constrains resolution, but the service should still pin `cu29 = "=1.0.0-rc2"` and `statig = "=0.4.1"` (or the versions in your pinned msrs revision's `Cargo.lock`), pin msrs by full git revision, and check with `cargo tree -i cu29 --depth 0`. Record the resolved versions in the spec. Treat an upgrade as a new baseline that must pass the tests, daemon checks and replay gate again.
+A caret requirement such as `cu29 = "1.0.0-rc2"` (`^1.0.0-rc2`) lets a workspace resolve the **newest** compatible cu29: 1.3.0 when tested, not the rc2 this skill and msrs were verified on. msrs pins `=1.0.0-rc2` / `=0.4.1` itself; the service should also pin `cu29 = "=1.0.0-rc2"` and `statig = "=0.4.1"` (or the versions in your pinned msrs revision's `Cargo.lock`), pin msrs by full git revision, and check with `cargo tree -i cu29 --depth 0`. Record the resolved versions in the spec. Treat an upgrade as a new baseline that must pass the tests, daemon checks and replay gate again.
 
 ### Payload rules (the #1 compile-error source)
 
@@ -236,7 +236,7 @@ use serde::{Deserialize, Serialize};
 pub struct EchoMsg(pub String);
 ```
 
-`#[derive(Default)]` on an enum needs a unit `#[default]` variant; otherwise implement `Default` by hand. Generic payloads such as `Cycle<T>` and `Batch<T>` work; name them through crate-root aliases (`pub type FeedCycle = Cycle<Feed>;`, `msg: "crate::FeedCycle"`). Since msrs #8, `TransportEvent<T>` derives the payload set and is a payload whenever `T` is; before that it was not (see Transport Integration).
+`#[derive(Default)]` on an enum needs a unit `#[default]` variant; otherwise implement `Default` by hand. Generic payloads such as `Cycle<T>` and `Batch<T>` work; name them through crate-root aliases (`pub type FeedCycle = Cycle<Feed>;`, `msg: "crate::FeedCycle"`). `TransportEvent<T>` derives the payload set and is a payload whenever `T` is (see Transport Integration).
 
 ### Boilerplate that must exist
 
@@ -282,7 +282,7 @@ Manual stepping (tests and harnesses): `start_all_tasks()` → `run_one_iteratio
 
 A long-running service calls `app.run()`: it starts tasks, loops at `rate_target_hz`, and on shutdown stops tasks and returns. Then drop the app to flush the log and join the transport. Measured behavior on rc2:
 
-- **Signals:** `run()` installs cu29's ctrlc handler, which by default catches SIGINT only. SIGTERM, which systemd sends, killed the process with exit 143 without stopping tasks. Since msrs #8, `msrs-core` depends on `ctrlc` with `termination`, so feature unification makes cu29's handler cover SIGTERM for every consumer. On older pins, add `ctrlc = { version = "3.5", features = ["termination"] }` to the service crate. Either way, verify that SIGTERM exits 0.
+- **Signals:** `run()` installs cu29's ctrlc handler, which by default catches SIGINT only. SIGTERM, which systemd sends, killed the process with exit 143 without stopping tasks. `msrs-core` depends on `ctrlc` with `termination`, so feature unification makes cu29's handler cover SIGTERM for every consumer. Verify that SIGTERM exits 0.
 - **Panics:** a panic in any task is caught by `run()`, which stops tasks and returns `Err`. cu29's panic hook writes `copper-crash-<ms>-<pid>.txt` into the **current directory**, even for panics the program catches. Set the working directory and supervise restarts.
 - **Log volume:** every iteration writes a copperlist, including idle ones. A three-task DAG used about 590 B per copperlist, about 2 GB/h at 1 kHz. rc2 has no setting to skip idle copperlists. Specify loop rate, log location, slab size and retention. Logs are slab files `<base>_0.copper`, `<base>_1.copper`, … plus a `<base>.copper` symlink; rotate or delete the whole family.
 - **Latency:** with source → FSM → sink in one iteration, round trip was about one loop period: roughly 1 ms at 1 kHz over a Unix socket. Derive deadlines from the configured rate and measured step times.
@@ -316,8 +316,8 @@ let mut app = EchoApplication::builder()...build()?;
 
 - `install()` **panics on double-install** and `new()` **consumes** the slot — building a second app (e.g. for replay) requires a fresh `install()` first. Building without `install()` returns a clear `CuError`
 - Shutdown is channel disconnect: drop the app, then `handles.join.join()`. A transport that polls its listener must also check for `Disconnected` on its outbound receiver, or it will never exit
-- Transport faults that affect behavior must reach the DAG as **recorded inputs**, not be swallowed on the driver thread. Use `TransportEvent<T>` (a payload since msrs #8) or a service-owned enum such as `Inbound::{Cmd(..), TransportError(String)}` with the payload derives. Wire-decoding failures can be answered by the transport without entering the DAG, but the spec must say so
-- A custom source task, such as a service-owned producer, uses the same injection: `msrs_transport::registry::install::<MyTask, _>(rx)` before `build()` and `registry::take::<MyTask, _>()?` in `new()` (msrs #8; slots are keyed by task type). On older pins the registry is private; a `static Mutex<Option<Receiver<T>>>` filled before `build()` and taken in `new()` works
+- Transport faults that affect behavior must reach the DAG as **recorded inputs**, not be swallowed on the driver thread. Use `TransportEvent<T>` or a service-owned enum such as `Inbound::{Cmd(..), TransportError(String)}` with the payload derives. Wire-decoding failures can be answered by the transport without entering the DAG, but the spec must say so
+- A custom source task, such as a service-owned producer, uses the same injection: `msrs_transport::registry::install::<MyTask, _>(rx)` before `build()` and `registry::take::<MyTask, _>()?` in `new()` (slots are keyed by task type)
 
 ---
 
@@ -343,7 +343,7 @@ fn tick_emits_nothing_when_idle() {
 }
 ```
 
-When the contract says "exactly one" or "none", assert on every emission with `msrs_core::run_step_all`, which returns them all in order. Since msrs #8 `run_step` panics on a second emission; before that it silently returned only the first, so on older pins call `step` with an `Effects` and assert on `take()`:
+When the contract says "exactly one" or "none", assert on every emission with `msrs_core::run_step_all`, which returns them all in order. `run_step` panics on a second emission, so it suits single-output machines:
 
 ```rust
 assert_eq!(run_step_all(&mut m, &Trigger::Message(&cmd)), vec![expected_output]);
@@ -360,19 +360,19 @@ Cover every specified transition, guard rejection, internal action, and time bou
 5. **Prove the gate works:** the `decode_from_std_read` loop stops at the first decode error, so end-of-log and corruption look the same. Check that copperlist IDs are contiguous and that the count matches the run. Run a negative control, such as a perturbed initial state or input, and require the gate to fail.
 6. **Check requirements:** run scenario assertions and deadline measurements as well. Reproducing an incorrect trace does not make the service correct. When time is a payload field, derive timing evidence from the same log: cycle gaps from `now_ns`, step time from the FSM slot's `metadata.process_time`, and deadline latencies.
 
-msrs's `examples/echo` replays every ingress cycle, with empty ones as `Tick` at their logged `tov` (msrs #8; before that its reader skipped empty cycles and never supplied ticks). `examples/watchdog` replays a time-dependent trip decision from recorded `Cycle` payloads under the real clock. Both are scaffolding: neither checks contiguous copperlist IDs or runs a negative control, so neither by itself completes a service's gate. Replaying an empty input as `Tick(0)` is valid only when the machine ignores ticks. See [implementation patterns §9](references/implementation-patterns.md#9-replay-gate).
+msrs's `examples/echo` replays every ingress cycle, with empty ones as `Tick` at their logged `tov`. `examples/watchdog` replays a time-dependent trip decision from recorded `Cycle` payloads under the real clock. Both are scaffolding: neither checks contiguous copperlist IDs or runs a negative control, so neither by itself completes a service's gate. Replaying an empty input as `Tick(0)` is valid only when the machine ignores ticks. See [implementation patterns §9](references/implementation-patterns.md#9-replay-gate).
 
 ---
 
 ## Anti-Patterns
 
 - **I/O or clock reads inside Store or handlers** — breaks the replay gate. Time is an explicit recorded input; I/O lives in the Transport.
-- **Bare `String`/`Vec<T>` as a copper payload** — no `TypePath` under reflect-off; use a derive-complete named type (`TransportEvent<T>` qualifies only since msrs #8).
+- **Bare `String`/`Vec<T>` as a copper payload** — no `TypePath` under reflect-off; use a derive-complete named type.
 - **Unpinned cu29** — the caret requirement resolves to a newer release than msrs was verified on.
 - **Lazy statig initialization inside `step`** — initial entry actions run inside the first trigger; initialize eagerly in `Default`.
 - **`Transition` to the current state for an internal rule** — runs exit/entry actions; use `Handled`.
-- **Deadlines driven by `Trigger::Tick`** — starved by sustained input (and not replayable from the log before msrs #8); use a `Cycle` payload.
-- **Several `emit` calls in one `FsmTask` step** — an error since msrs #8 (silently dropped before); emit one composite output or use `FsmBatchTask`.
+- **Deadlines driven by `Trigger::Tick`** — starved by sustained input; use a `Cycle` payload.
+- **Several `emit` calls in one `FsmTask` step** — a runtime error; emit one composite output or use `FsmBatchTask`.
 - **`unwrap`/`unreachable!`/panics on input-dependent paths** — a handler panic stops the whole service; reject the input instead.
 - **Depending on `cu29-export`** — force-enables bevy_reflect and breaks the transport tasks; inline the log reader instead.
 - **Generic paths in RON `type:`** — the codegen can't parse them; use crate-root type aliases.
@@ -406,7 +406,7 @@ msrs's `examples/echo` replays every ingress cycle, with empty ones as `Tick` at
 
 **Testing**
 - [ ] Transition and invariant tests include shared-event precedence, rejection, time boundaries and required/forbidden effects
-- [ ] "Exactly one"/"no output" assertions use `run_step_all` (or `step` + `Effects::take` on older pins)
+- [ ] "Exactly one"/"no output" assertions use `run_step_all`
 - [ ] Scenario, fault/restart and load/deadline checks satisfy the service contract
 - [ ] Store queries unit-tested directly
 
