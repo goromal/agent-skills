@@ -31,7 +31,8 @@ gate. For code that realizes these contracts on msrs, see
   own coordination contract; a rectangle alone does not specify concurrency.
 - Every behavioral arrow must resolve to a transition or explicitly identified
   rule. A summary view may omit detail only if it links to the detailed contract.
-- Regenerate the preview after editing. Review the source, preview and tables
+- Regenerate the preview from the editable source after editing (draw.io:
+  File → Export as → SVG; Excalidraw: Export image → SVG). Review the source, preview and tables
   together; conflicting versions block implementation of the disputed behavior.
 
 ---
@@ -106,7 +107,8 @@ their legal combinations and coordination, if present.
 
 Define every guard's rejection behavior. When several conditions can fail at
 once, state which rejection reason is reported (for example, "first failing
-condition in this order"). Define a result for unexpected events; nothing in
+condition in this order"), or that every failing condition is reported in a
+defined order, as a mission validator must (example 07). Define a result for unexpected events; nothing in
 statig reports an unhandled event. When a shared event has leaf-specific effects
 (for example, release while driving must also stop motion), say which leaf
 handles it.
@@ -116,7 +118,9 @@ Describe required and forbidden outputs, including steps with no output.
 For processing/estimation/control services, also define the transformation or
 algorithm contract: valid input domain, output meaning, accuracy/tolerances,
 coordinate conversions and assumptions. An FSM alone does not specify the
-computation performed while a state is active.
+computation performed while a state is active. Give formulas, the order of
+floating-point accumulation when outputs are compared as bytes, and a worked
+example a reviewer can check by hand (example 07).
 
 ## Ordering and time
 
@@ -135,6 +139,11 @@ step as a deadline. When several status reasons apply in one step, define their
 precedence. State the scope of priorities: events already visible in a
 batch, queued traffic, or an independent path. Define which shared events every
 child must defer; superstates are child-first dispatch, not automatic overrides.
+When rules of different precedence apply at the same instant (faults before
+progress), order them as separate internal steps. When a command and an
+observation arrive in the same step, say which the command is checked against.
+For a service made of several FSM stages, state what each stage consumes and
+forwards and their order within one cycle (example 08).
 
 | Requirement | Bound / clock / measurement points | On violation |
 |-------------|------------------------------------|--------------|
@@ -223,6 +232,13 @@ Common gaps found when specs were implemented:
 - A timed rule omits its time source or its order relative to inputs.
 - A shared event's effect differs by leaf, but the spec assigns it to the composite.
 - The spec gives no log budget, signal behavior or working directory for a daemon.
+- A command and an observation drain in the same step, and nothing says which
+  one the command is checked against.
+- A reset meant for a whole composite sits in the composite's entry action,
+  which a transition between its leaves never runs.
+- A validator reports only the first issue where its user needs every issue.
+- A peer is left in a mode that blocks the next command (an autopilot still in
+  land mode after landing), and no one owns switching it back.
 
 Human approval applies to the behavior to implement. If implementation exposes a
 missing requirement, propose the specific contract change and resolve it with
