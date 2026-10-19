@@ -122,8 +122,9 @@ computation performed while a state is active.
 
 What makes one logical step? Which events can occur in it? What produces each
 decision instant, and where is its time recorded? On msrs, `Trigger::Tick` is
-starved by input and its time is not logged, so time-dependent decisions need
-time carried in a recorded payload. Write the step as an ordered algorithm:
+starved by input (and, before msrs #8, its time was not logged), so
+time-dependent decisions need time carried in a recorded payload such as
+`CycleIngressTask`'s `Cycle`. Write the step as an ordered algorithm:
 
 1. Pre-input rules (for example backward clock or overflow)
 2. Inputs in arrival order, with any latches that last for the rest of the step
