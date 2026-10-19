@@ -101,8 +101,11 @@ immediately become fresh if it carries a valid sample. No checkpoint is restored
 Use a single `Cycle` input payload and single `Status` output. The producer is a
 required scheduling/ingress component, not a timer inside the store. The stock
 msrs adapter supplies Tick only on empty input; it does not create this cycle
-contract. Implement and verify the producer and dispatch budget before claiming
-R4. Incidental runtime `Tick` triggers are no-ops in this monitor.
+contract. Implement the producer as a service-owned copper source task that
+emits a `Cycle` every runtime iteration. See
+[implementation patterns §5](../../implementation-patterns.md#5-timed-producer-source-task).
+Verify it and the dispatch budget before claiming R4. Incidental runtime `Tick`
+triggers are no-ops in this monitor.
 
 Store accepted sequence/time and last cycle time; classify using pure methods.
 Record configuration, cold initial state, exact ordered Cycle payloads, incidental
