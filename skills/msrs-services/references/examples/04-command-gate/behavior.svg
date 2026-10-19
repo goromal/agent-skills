@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="555" viewBox="0 0 900 555" role="img" aria-labelledby="title desc">
+<title id="title">4. A teleoperation command gate</title>
+<desc id="desc">Editable source is the adjacent behavior.drawio. Transition and rule IDs refer to SPEC.md.</desc>
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#334155"/></marker></defs>
+<rect width="900" height="555" fill="white"/>
+<g font-family="DejaVu Sans, sans-serif" fill="#0f172a">
+<text x="450.0" y="35.7" text-anchor="middle" font-size="22" font-weight="bold">4. A teleoperation command gate</text>
+<ellipse cx="30.0" cy="195.0" rx="10.0" ry="10.0" fill="#334155"/>
+<rect x="65" y="160" width="160" height="70" rx="10" fill="#e0f2fe" stroke="#334155" stroke-width="1.5"/>
+<text x="145.0" y="201.0" font-size="16" text-anchor="middle">S1 / disabled</text>
+<rect x="365" y="65" width="450" height="270" rx="10" fill="#f8fafc" stroke="#334155" stroke-width="1.5"/>
+<text x="590.0" y="93" font-size="16" text-anchor="middle">S2 / enabled</text>
+<ellipse cx="430.0" cy="125.0" rx="10.0" ry="10.0" fill="#334155"/>
+<rect x="405" y="165" width="150" height="60" rx="10" fill="#e0f2fe" stroke="#334155" stroke-width="1.5"/>
+<text x="480.0" y="201.0" font-size="16" text-anchor="middle">S3 / idle</text>
+<rect x="625" y="165" width="150" height="60" rx="10" fill="#e0f2fe" stroke="#334155" stroke-width="1.5"/>
+<text x="700.0" y="201.0" font-size="16" text-anchor="middle">S4 / driving</text>
+<path d="M40,195 L65,195" fill="none" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M430,135 L430,165" fill="none" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M225,195 L405,195" fill="none" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="315.0" y="176.9" text-anchor="middle" font-size="14">T1: Enable</text>
+<path d="M520,165 L520,125 L700,125 L700,165" fill="none" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="610.0" y="114.9" text-anchor="middle" font-size="14">T2: Vel [valid_vel]</text>
+<path d="M700,225 L700,265 L480,265 L480,225" fill="none" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="590.0" y="287.9" text-anchor="middle" font-size="14">T5 timeout · L3 release · L4 lease expiry</text>
+<path d="M590,335 L590,375 L145,375 L145,230" fill="none" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="370.0" y="356.9" text-anchor="middle" font-size="14">T4: Disable (any client; latches for the cycle)</text>
+<text x="450.0" y="426.9" text-anchor="middle" font-size="14">T3: valid Vel while driving updates the motor command (internal).</text>
+<text x="450.0" y="454.9" text-anchor="middle" font-size="14">T6–T9 are internal; rejections never change state. L1–L4 lease rules apply in every state.</text>
+<text x="450.0" y="482.9" text-anchor="middle" font-size="14">Each Cycle: inputs in arrival order, then CycleEnd (L4, T5); one GateOut per Cycle.</text>
+<text x="450.0" y="510.9" text-anchor="middle" font-size="14">Motor command is non-zero only in S4. Entering S2 always starts in S3; no history.</text>
+</g></svg>
