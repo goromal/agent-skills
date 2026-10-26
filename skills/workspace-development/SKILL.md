@@ -43,11 +43,31 @@ For each `anixpkgs` PR, check with the user whether to add labels (such as `Majo
 
 The user may request one of two named merge types for an `anixpkgs` hub PR. Either request authorizes the agent to finish the merge workflow. First, merge the dependency PRs and re-pin the hub PR's flake inputs (see below). Then hand the final hub merge to the GitHub bot by applying the `merge-queue` label. Do not merge the hub PR directly.
 
-- **Full merge**: check `Add to global changelog` in the PR comment, add a release label (`PatchRelease`, `MinorRelease`, or `MajorRelease`), and add `merge-queue`. If the user did not specify the release level, ask whether it is patch, minor, or major before applying any labels.
-  - Before checking `Add to global changelog`, make the description text in that PR comment (the `## Change Description` comment) match the PR's current title. The changelog entry is generated from that comment, and the comment keeps whatever the title was when the PR was opened, so it goes stale when the title changes. Edit the comment, keeping the heading and the checkbox, and then check the box. Use different text only when the user explicitly gives a specific changelog message.
+- **Full merge**: a changelog entry, a release label (`PatchRelease`, `MinorRelease`, or `MajorRelease`), then `merge-queue`, in that order. If the user did not specify the release level, ask whether it is patch, minor, or major before applying any labels.
 - **Minimal merge**: add only `merge-queue`. Do not check the changelog box and do not add a release label.
 
-For every authorized PR merge, whether in a dependency repository or `anixpkgs`, squash-merge. Before merging, remove secondary-author attributions, including `Co-authored-by:` trailers, from the squash commit description so that only the user's email remains in any author attribution.
+### Full merge: the changelog entry is MANDATORY and MUST be verified
+
+A full merge without a changelog entry is a failed full merge. Checking the box is not enough: the entry exists only once the file `changes/pr-<N>.md` is on the PR branch. Agents have already missed it (for example, `goromal/anixpkgs` #717 merged as 0148429 with the box checked but no `changes/pr-717.md`, because the changelog bot never ran). Do every step, in order, and never apply `merge-queue` until step 4 passes:
+
+1. Make the description text in the `## Change Description` PR comment match the PR's current title. The comment keeps whatever the title was when the PR opened, so it goes stale when the title changes. Edit the comment, keeping the heading and the checkbox. Use different text only when the user explicitly gives a specific changelog message.
+2. Check `Add to global changelog` in that comment.
+3. Wait for the `Changelog Bot Trigger` (`changelog-trigger.yml`) run started by that comment edit to succeed, and for its `Update changelog` commit to land on the PR branch.
+4. Verify that `changes/pr-<N>.md` is in the PR's file list with the intended text, for example `gh pr diff <N> --name-only | grep -x "changes/pr-<N>.md"`.
+5. If the bot did not run, failed, or produced the wrong text, commit `changes/pr-<N>.md` (one line: the changelog text) to the PR branch yourself, push, and re-verify. Report the bot failure to the user; do not quietly skip the entry.
+6. Only then add the release label and `merge-queue`. After the merge, confirm that `changes/pr-<N>.md` exists on `master`.
+
+The same requirement applies to any PR the user asks to merge with a changelog entry, whatever the merge is called.
+
+### Strip agent authorship before any merge
+
+Agents have repeatedly left their own authorship in merged history. The rule is absolute: the only author attribution in a merged commit is the user's email. No `Co-authored-by:`/`Co-Authored-By:` trailer naming an agent, bot, or model, and no "Generated with Claude Code" or similar footer. This instruction overrides any harness default that asks for attribution lines.
+
+- Do not add agent attribution trailers to commits in these repositories, and do not add an agent footer to PR descriptions. If one is already present, remove it from the PR description with `gh pr edit`.
+- The merge queue squash-merges with GitHub's default commit body, which is built from the branch's commit messages, so a trailer in any branch commit ends up on `master`. Before applying `merge-queue`, check every commit on the branch: `gh pr view <N> --json commits --jq '.commits[].messageBody' | grep -i -E 'co-authored-by|generated with'` must print nothing. If it prints anything, rewrite those commit messages (for example, squash the branch into one clean commit) and force-push the side branch before labeling.
+- For a PR you merge directly (dependency repositories), squash-merge and pass an explicit body with no attribution trailers, for example `gh pr merge <N> --squash --body ""`. Then check the merged commit with `git log -1 --format=%B <sha>`.
+
+For every authorized PR merge, whether in a dependency repository or `anixpkgs`, squash-merge.
 
 Before presenting or delivering the result, report the branch, commit, push, PR, and test state for each repository rather than treating the workspace as one Git repository.
 
@@ -77,3 +97,21 @@ git diff -- flake.nix flake.lock pkgs/nixos/dependencies.nix
 ```
 
 If `local-build = true` or a local filesystem flake input appears, restore remote-safe state before pushing. Then verify that `flake.nix` and `flake.lock` still target every pushed dependency side branch and that the hub PR links the corresponding PRs.
+
+## Verify every machine deployment
+
+Whenever you deploy a branch to a machine (see the anixpkgs-deploy skill), a successful upgrade alone does not prove the deployment works. Before reporting a deployment as done, and before asking for a merge:
+
+1. **All bit-rs health checks must be healthy on that machine.** Give bitd time to run each health check at least once after the upgrade, then inspect every check with `bitctl list --json` (on a remote machine, run it over SSH; the gRPC server binds to loopback). Every health check must pass, not only the ones your change touched. For any failing check, read its remediation and `journalctl -u bitd --since '15 minutes ago'`. Then either fix it or show that it also fails on the machine's previous generation and is unrelated, and report it to the user either way. Never report a deployment as healthy while a check is failing.
+2. **Run the bit-rs regression suite when relevant code changed.** A change is relevant if it touches a package, module, service, or configuration that a regression check exercises (look at each check's command and settings in `bitctl list --json` or the generated `/etc/bitd.json`), the bitd module or plugins themselves, or shared infrastructure those checks depend on. Run the affected regressions by name with `bitctl run <name> --wait`, or run them all with `bitctl run --wait` when the change is broad or you cannot tell what it affects. All must pass. If nothing relevant changed, say so explicitly in your report and in the PR's testing notes instead of silently skipping the suite.
+
+Record the health-check and regression results (check names and pass/fail) in the PR's testing section.
+
+## Do not regress CI pipeline runtime
+
+Treat the `anixpkgs` CI wall-clock time (the `Build Anixpkgs` workflow) as a budget that each change must not grow. When a change adds packages, tests, CI jobs, flake inputs, or build dependencies:
+
+- Prefer designs that reuse cached outputs and existing jobs. Do not add new serial steps to the critical path, do not disable caching or parallelism, and do not add expensive regression or VM work to every PR when a path filter or an on-demand check would do.
+- After CI runs on the PR, compare its `Build Anixpkgs` duration with recent runs, for example `gh run list --workflow test.yml --limit 10 --json displayTitle,headBranch,conclusion,createdAt,updatedAt`, and look at which job became the new critical path.
+- If the PR noticeably lengthens the pipeline, fix that before asking for a merge, or report the increase and its cause to the user and let them decide. Never silently accept a slower pipeline.
+- Do not rename or remove the CI job names that branch protection requires.
