@@ -98,6 +98,19 @@ git diff -- flake.nix flake.lock pkgs/nixos/dependencies.nix
 
 If `local-build = true` or a local filesystem flake input appears, restore remote-safe state before pushing. Then verify that `flake.nix` and `flake.lock` still target every pushed dependency side branch and that the hub PR links the corresponding PRs.
 
+## Check memory before every deploy
+
+A deploy's nix evaluation and build need gigabytes of RAM on top of everything already running. On a machine that is already short of memory it can freeze the machine for hours, until someone reboots it (ats, 2026-11-11: about 14 idle agent sessions held about 12 of 15 GB, and the deploy's evaluation pushed it over). Before you trigger any deploy, local or remote:
+
+1. Read the target machine's memory checks (over SSH for a remote machine):
+   ```bash
+   bitctl list --json | jq -c '.[] | select(.name == "memory" or .name == "agent_sessions") | {name, state, detail}'
+   ```
+2. If either check is not `STATE_PASSED`, do not deploy. Read `journalctl -u bitd --since '5 minutes ago'`, which lists the top memory users by systemd unit and the agent-session counts per tmux socket. Report them to the user and ask them to end idle agent sessions or other large consumers. Re-check, then deploy only once both checks pass.
+3. If the machine predates these checks (neither appears in the list), check headroom by hand: `MemAvailable + SwapFree` in `/proc/meminfo` must be at least 15% of `MemTotal` and at least 3 GB. Treat a shortfall the same way.
+
+Do not work around a failing memory check by deploying anyway, and do not end the user's agent sessions yourself; those sessions may hold unsaved work.
+
 ## Verify every machine deployment
 
 Whenever you deploy a branch to a machine (see the anixpkgs-deploy skill), a successful upgrade alone does not prove the deployment works. Before reporting a deployment as done, and before asking for a merge:
