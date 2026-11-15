@@ -71,6 +71,8 @@ For every authorized PR merge, whether in a dependency repository or `anixpkgs`,
 
 Before presenting or delivering the result, report the branch, commit, push, PR, and test state for each repository rather than treating the workspace as one Git repository.
 
+Whenever work reaches the point where the user must review (PRs opened or updated and awaiting their review or merge), give the full URL of the hub PR (usually `anixpkgs`, e.g. `https://github.com/goromal/anixpkgs/pull/<N>`) explicitly in that message. Do not substitute a bare number, a `repo#N` shorthand, or a link only to dependency PRs.
+
 ## Wire remote dependency branches into anixpkgs
 
 The `anixpkgs` hub PR MUST include changes to both `flake.nix` and `flake.lock` for each changed flake dependency:
